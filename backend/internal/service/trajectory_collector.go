@@ -11,6 +11,7 @@ package service
 //   - 流式响应在网关侧重组为完整 Anthropic message body，thinking/signature/tool_use.input 全保真。
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -35,6 +36,14 @@ const (
 	trajectoryDirEnv     = "SUB2API_TRAJECTORY_DIR"     // 输出目录，默认 /app/data/trajectories
 	trajectoryDefaultDir = "/app/data/trajectories"
 )
+
+// 响应侧质检：落盘前最后一道闸，只做结构性判定，不引入硬编码阈值。
+// 设计原因：
+//   - 上游可能剥离 signature（如 jchpro.com），thinking block 拿不到签名 → 验收红线 REJECT；
+//   - 末轮 stop_reason 必须 end_turn，被 tool_use / max_tokens / stop_sequence 截断的不合格。
+//
+// 注：thinking 文本长度、output_tokens 门槛这类阈值不在这层做——简单问题（"再见"）的合规
+// 思考可能就两三个字，硬定阈值会误杀真实样本。打包阶段的 validator 才是抽样质量评估的地方。
 
 // gin.Context 中存放采集上下文的 key（避免改函数签名）。
 const trajectoryCaptureKey = "sub2api_trajectory_capture"
@@ -190,6 +199,20 @@ type TrajectoryCollector struct {
 	statOutputTokens  atomic.Int64 // 累计 output_tokens
 	statModelOpus46   atomic.Int64 // opus-4-6 落盘数
 	statModelOpus47   atomic.Int64 // opus-4-7 落盘数
+
+	// 响应侧质检拒收计数（落盘前过滤掉的废数据，只看结构，不设硬编码阈值）。
+	statRejectedNoSignature   atomic.Int64 // thinking 块缺 signature 字段（上游剥离）
+	statRejectedBadStopReason atomic.Int64 // stop_reason 不是 end_turn（被工具调用或长度截断）
+
+	// 自动打包器（packer）相关：静默扫描 → 质检 → 合格自动 zip。
+	packEnabled  bool          // 是否开启自动打包
+	packInterval time.Duration // 后台扫描间隔
+	packSilence  time.Duration // session 静默判定窗口
+	packMu       sync.Mutex    // 保护 pack_state.json 读改写
+
+	statSellable    atomic.Int64 // 累计打包成功（能卖钱）的 session 数
+	statUnqualified atomic.Int64 // 累计判定不合格的 session 数
+	lastPackAt      atomic.Int64 // 上次成功打包的 unix 时刻（秒）
 }
 
 // newTrajectoryCollectorFromEnv 按环境变量构造采集器；未开启时返回 enabled=false 的实例。
@@ -207,6 +230,17 @@ func newTrajectoryCollectorFromEnv() *TrajectoryCollector {
 	}
 	if enabled {
 		logger.LegacyPrintf("service.trajectory", "Trajectory collector enabled, output dir=%s", dir)
+	}
+
+	// 自动打包器：仅在采集开启且 pack 开关打开时启动后台扫描 goroutine。
+	tc.packEnabled = enabled && parseDebugEnvBool(os.Getenv(trajectoryPackEnv))
+	tc.packInterval = time.Duration(getEnvIntSeconds(trajectoryPackIntervalEnv, trajectoryPackDefaultInterval)) * time.Second
+	tc.packSilence = time.Duration(getEnvIntSeconds(trajectorySilenceEnv, trajectoryPackDefaultSilence)) * time.Second
+	if tc.packEnabled {
+		logger.LegacyPrintf("service.trajectory",
+			"Trajectory packer enabled, scan_interval=%s silence_window=%s sellable_dir=%s",
+			tc.packInterval, tc.packSilence, filepath.Join(dir, sellableSubDir))
+		go tc.runPackLoop()
 	}
 	return tc
 }
@@ -230,12 +264,75 @@ type trajectoryResponseWrap struct {
 	ResponseData json.RawMessage `json:"response_data"`
 }
 
+// qualityCheckResponse 在 Submit 入口对响应做「落盘级」结构性质检（对齐需求 §3.3 落盘硬规则）。
+// 返回空串表示通过。reject 时调用方负责递增对应计数器，本函数不动 stat。
+//
+// 关键区分（之前在此处犯过的错）：
+//   - 本函数是「落盘层」闸门，只按 §3.3 判定单条 call 是否满足"原样落盘"的硬条件。
+//   - 「末轮必须 end_turn 且含 summary」是 §4 的「打包卖钱质量门槛」，由 packer 的
+//     validateSession 评估整个 session（取最长 trajectory）时判定，绝不在落盘层逐条拒收。
+//   - 因此 stop_reason==tool_use 的中间轮是合法且【必须保存】的（铁律 §1.1：每一次 LLM call
+//     都要保存，不能丢失中间轮次）。end_turn 仅影响打包评估与统计计数，不影响是否落盘。
+//
+// 落盘质检规则（任意一条不满足即拒收，对齐 §3.3）：
+//  1. stop_reason 非空且 ∈ {end_turn, tool_use, max_tokens, stop_sequence}。
+//  2. 「每个」thinking 块都必须 thinking 非空且 signature 非空（§3.3 是条件句：有 thinking 块才
+//     要求签名，缺/空 signature 视为上游剥签名的不合规响应，红线）。
+//
+// 关键区分（之前在此处犯过的第二个错）：
+//   - §3.3 落盘层只约束「有 thinking 块的轮」——没有 thinking 块的轮（如纯 text 的 end_turn
+//     总结末轮）是【合法的】，必须照常落盘，绝不能因「这一轮没思考块」就拒收。
+//   - 「整个 session 至少要有 1 轮非空 thinking」是 §4.5 的打包门槛，由 packer 评估整条
+//     trajectory 时判定，绝不在落盘层逐条拒收。
+//   - 旧逻辑 `!hasThinkingBlock` 把无思考块的合法轮（尤其 end_turn 总结末轮）错杀，导致
+//     session 永远凑不齐合格末轮、永远进不了 sellable。
+func qualityCheckResponse(responseData []byte) string {
+	// 规则 1：stop_reason 必须非空且在允许集合内（tool_use 等中间轮合法，必须放行落盘）。
+	switch gjson.GetBytes(responseData, "stop_reason").String() {
+	case "end_turn", "tool_use", "max_tokens", "stop_sequence":
+		// 合法 stop_reason，放行
+	default:
+		// 仅 null 或集合外的非法值才拒收（§3.3：stop_reason 不能为 null）。
+		return "bad_stop_reason"
+	}
+	// 规则 2：遍历 content，「每个」thinking 块都必须 thinking 非空且 signature 非空。
+	// 没有 thinking 块 → 合法放行（§3.3 是条件句，不是「必须有 thinking 块」）。
+	var badThinking bool
+	gjson.GetBytes(responseData, "content").ForEach(func(_, item gjson.Result) bool {
+		if item.Get("type").String() != "thinking" {
+			return true // 非 thinking 块，跳过
+		}
+		think := strings.TrimSpace(item.Get("thinking").String())
+		sig := strings.TrimSpace(item.Get("signature").String())
+		if think == "" || sig == "" {
+			badThinking = true // 任一 thinking 块缺 thinking 或 signature 即不合规
+			return false       // 提前结束遍历
+		}
+		return true
+	})
+	if badThinking {
+		return "no_signature"
+	}
+	return ""
+}
+
 // Submit 异步提交一条采集记录。responseData 为完整 Anthropic message body（已解码）。
 func (tc *TrajectoryCollector) Submit(cap *trajectoryCapture, responseData []byte) {
 	if !tc.Enabled() || cap == nil {
 		return
 	}
 	if len(responseData) == 0 || len(cap.requestBody) == 0 {
+		return
+	}
+	// 响应侧质检：落盘前最后一道闸，过不去的样本计入 rejected_*，绝不写盘。
+	if reason := qualityCheckResponse(responseData); reason != "" {
+		switch reason {
+		case "no_signature":
+			tc.statRejectedNoSignature.Add(1)
+		case "bad_stop_reason":
+			tc.statRejectedBadStopReason.Add(1)
+		}
+		logger.LegacyPrintf("service.trajectory", "reject sample: session=%s reason=%s", cap.sessionID, reason)
 		return
 	}
 	// 复制一份，避免与主链路共享底层数组。
@@ -304,15 +401,40 @@ func (tc *TrajectoryCollector) recordSaveStats(model string, stream bool, respon
 	}
 }
 
+// marshalNoEscapeIndent 等价于 json.MarshalIndent，但不把中文等非 ASCII 转成 \uXXXX、
+// 也不转义 < > &，使落盘文件中文直接可读，与交付样本（deliver_*）保持一致。
+func marshalNoEscapeIndent(v interface{}) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	// Encoder.Encode 会在末尾追加一个换行，去掉以与 MarshalIndent 行为一致。
+	return bytes.TrimRight(buf.Bytes(), "\n"), nil
+}
+
+// marshalNoEscape 等价于 json.Marshal，但不转义非 ASCII / < > &（用于 jsonl 紧凑行）。
+func marshalNoEscape(v interface{}) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	return bytes.TrimRight(buf.Bytes(), "\n"), nil
+}
+
 // write 把一条记录写盘：sessions/{session}/{ts}__{req}.json + 追加 all_calls.jsonl + 更新 manifest.json。
 func (tc *TrajectoryCollector) write(rec *trajectoryTopRecord) error {
-	// 序列化（格式化版本用于人工抽检）。
-	pretty, err := json.MarshalIndent(rec, "", "  ")
+	// 序列化（格式化版本用于人工抽检）。中文不转义，保持与交付样本一致。
+	pretty, err := marshalNoEscapeIndent(rec)
 	if err != nil {
 		return fmt.Errorf("marshal pretty: %w", err)
 	}
 	// 紧凑版本用于 jsonl 与 sha256 校验。
-	compact, err := json.Marshal(rec)
+	compact, err := marshalNoEscape(rec)
 	if err != nil {
 		return fmt.Errorf("marshal compact: %w", err)
 	}
@@ -422,7 +544,7 @@ func (tc *TrajectoryCollector) updateManifest(rec *trajectoryTopRecord, relCallP
 	mf.CallCount = len(mf.Records)
 	mf.UpdatedAt = time.Now().UTC().Format("2006-01-02T15:04:05.000000Z")
 
-	out, err := json.MarshalIndent(mf, "", "  ")
+	out, err := marshalNoEscapeIndent(mf)
 	if err != nil {
 		return err
 	}
@@ -649,6 +771,12 @@ type TrajectoryStats struct {
 	EndTurnSaved  int64 `json:"end_turn_saved"`  // 末轮 end_turn 数（合格末轮）
 	ToolUseEnd    int64 `json:"tool_use_end_saved"` // 末轮 tool_use 数（不合格末轮，需补完整结束轮）
 
+	// 响应侧质检拒收（落盘前过滤掉的废数据，按原因分桶）。仅保留无阈值的结构性规则。
+	RejectedNoSignature   int64   `json:"rejected_no_signature"`    // thinking 块缺 signature（上游剥离）
+	RejectedBadStopReason int64   `json:"rejected_bad_stop_reason"` // stop_reason 不是 end_turn
+	RejectedTotal         int64   `json:"rejected_total"`           // 各项之和，便于一眼看废数据总量
+	RejectRate            float64 `json:"reject_rate"`              // rejected_total / matched（多少命中样本被废）
+
 	// token 累计。
 	TotalInputTokens  int64 `json:"total_input_tokens"`
 	TotalOutputTokens int64 `json:"total_output_tokens"`
@@ -665,6 +793,14 @@ type TrajectoryStats struct {
 	// 磁盘累计（从 manifest.json 读，跨重启准确）。
 	DiskSessionCount int `json:"disk_session_count"`
 	DiskCallCount    int `json:"disk_call_count"`
+
+	// 自动打包（能卖钱的合格数据）相关。
+	PackEnabled      bool   `json:"pack_enabled"`       // 是否开启自动打包
+	SellableDir      string `json:"sellable_dir"`       // 合格 zip 存放目录
+	SellableCount    int    `json:"sellable_count"`     // 已打包（能卖钱）的 session 数 = sellable/ 下 zip 数
+	UnqualifiedCount int    `json:"unqualified_count"`  // 判定不合格的 session 数
+	PendingCount     int    `json:"pending_count"`      // 尚未判定（可能还在对话或静默期内）的 session 数
+	LastPackAt       string `json:"last_pack_at"`       // 上次成功打包时刻（UTC），无则空串
 }
 
 // ratio 安全除法，分母为 0 返回 0，结果保留 4 位小数。
@@ -697,19 +833,32 @@ func (tc *TrajectoryCollector) Stats() TrajectoryStats {
 		NonStreamSaved:    tc.statNonStreamSaved.Load(),
 		EndTurnSaved:      tc.statEndTurnSaved.Load(),
 		ToolUseEnd:        tc.statToolUseEndSaved.Load(),
+		RejectedNoSignature:   tc.statRejectedNoSignature.Load(),
+		RejectedBadStopReason: tc.statRejectedBadStopReason.Load(),
 		TotalInputTokens:  tc.statInputTokens.Load(),
 		TotalOutputTokens: tc.statOutputTokens.Load(),
 		ModelOpus46:       tc.statModelOpus46.Load(),
 		ModelOpus47:       tc.statModelOpus47.Load(),
 	}
+	st.RejectedTotal = st.RejectedNoSignature + st.RejectedBadStopReason
 	st.MatchRate = ratio(st.Matched, st.Evaluated)
 	st.SaveRate = ratio(st.Saved, st.Submitted)
 	st.EndTurnRate = ratio(st.EndTurnSaved, saved)
+	st.RejectRate = ratio(st.RejectedTotal, st.Matched)
 
 	// 磁盘累计：读 manifest.json（失败则保持 0，不影响其余字段）。
 	sessions, calls := tc.readManifestCounts()
 	st.DiskSessionCount = sessions
 	st.DiskCallCount = calls
+
+	// 自动打包统计（能卖钱的合格数据）。
+	st.PackEnabled = tc.packEnabled
+	st.SellableDir = filepath.Join(tc.dir, sellableSubDir)
+	sellable, unqualified, pending, lastPackAt := tc.packStatsSnapshot()
+	st.SellableCount = sellable
+	st.UnqualifiedCount = unqualified
+	st.PendingCount = pending
+	st.LastPackAt = lastPackAt
 	return st
 }
 
