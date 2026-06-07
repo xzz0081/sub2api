@@ -204,14 +204,13 @@ type TrajectoryCollector struct {
 	statRejectedNoSignature   atomic.Int64 // thinking 块缺 signature 字段（上游剥离）
 	statRejectedBadStopReason atomic.Int64 // stop_reason 不是 end_turn（被工具调用或长度截断）
 
-	// 自动打包器（packer）相关：静默扫描 → 质检 → 合格自动 zip。
-	packEnabled  bool          // 是否开启自动打包
-	packInterval time.Duration // 后台扫描间隔
-	packSilence  time.Duration // session 静默判定窗口
-	packMu       sync.Mutex    // 保护 pack_state.json 读改写
+	// 自动打包器（packer，v2 段语义）：每次 stop_reason==end_turn 落盘后立即触发 tryPackSegment，
+	// 不再有定时扫描兜底。packMu 保护 pack_state.json 读改写以及同 sid 的段切分。
+	packEnabled bool       // 是否开启自动打包
+	packMu      sync.Mutex // 保护 pack_state.json 读改写 / 同 sid 段切分
 
-	statSellable    atomic.Int64 // 累计打包成功（能卖钱）的 session 数
-	statUnqualified atomic.Int64 // 累计判定不合格的 session 数
+	statSellable    atomic.Int64 // 累计打包成功（能卖钱）的段数（v2 段维度）
+	statUnqualified atomic.Int64 // v2 不再永久判死，保留计数器避免外部引用错乱（不再自增）
 	lastPackAt      atomic.Int64 // 上次成功打包的 unix 时刻（秒）
 }
 
@@ -232,15 +231,13 @@ func newTrajectoryCollectorFromEnv() *TrajectoryCollector {
 		logger.LegacyPrintf("service.trajectory", "Trajectory collector enabled, output dir=%s", dir)
 	}
 
-	// 自动打包器：仅在采集开启且 pack 开关打开时启动后台扫描 goroutine。
+	// 自动打包器（v2 段语义，即时触发）：开启后由每次 end_turn 落盘成功后调用 tryPackSegment 直接打段，
+	// 不再启后台扫描 goroutine。
 	tc.packEnabled = enabled && parseDebugEnvBool(os.Getenv(trajectoryPackEnv))
-	tc.packInterval = time.Duration(getEnvIntSeconds(trajectoryPackIntervalEnv, trajectoryPackDefaultInterval)) * time.Second
-	tc.packSilence = time.Duration(getEnvIntSeconds(trajectorySilenceEnv, trajectoryPackDefaultSilence)) * time.Second
 	if tc.packEnabled {
 		logger.LegacyPrintf("service.trajectory",
-			"Trajectory packer enabled, scan_interval=%s silence_window=%s sellable_dir=%s",
-			tc.packInterval, tc.packSilence, filepath.Join(dir, sellableSubDir))
-		go tc.runPackLoop()
+			"Trajectory packer enabled (v2 segment, immediate), sellable_dir=%s",
+			filepath.Join(dir, sellableSubDir))
 	}
 	return tc
 }
@@ -353,6 +350,7 @@ func (tc *TrajectoryCollector) Submit(cap *trajectoryCapture, responseData []byt
 	tc.statSubmitted.Add(1)
 	model := cap.model
 	stream := cap.stream
+	sid := rec.SessionID
 
 	go func() {
 		defer func() {
@@ -367,6 +365,12 @@ func (tc *TrajectoryCollector) Submit(cap *trajectoryCapture, responseData []byt
 		}
 		// 落盘成功，更新统计。
 		tc.recordSaveStats(model, stream, respCopy)
+
+		// v2 段语义：本次 call 是 end_turn 时立即触发段打包尝试，不再依赖 5 分钟后台扫描兜底。
+		// 不是 end_turn（如 tool_use 中间轮）→ 不打包，等下一次 end_turn 时再判段。
+		if tc.packEnabled && gjson.GetBytes(respCopy, "stop_reason").String() == "end_turn" {
+			tc.tryPackSegment(sid)
+		}
 	}()
 }
 
