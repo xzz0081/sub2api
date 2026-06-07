@@ -967,6 +967,14 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 	}
 }
 
+// TrajectoryStats 返回轨迹采集统计（JSON）。
+// GET /v1/admin/trajectory/stats，走 admin 管理鉴权。
+// 返回判定/命中/落盘/末轮合格率/token/模型分布等指标，供脚本调用监控采集进度。
+func (h *GatewayHandler) TrajectoryStats(c *gin.Context) {
+	stats := h.gatewayService.TrajectoryStats()
+	c.JSON(http.StatusOK, stats)
+}
+
 // Models handles listing available models
 // GET /v1/models
 // Returns models based on account configurations (model_mapping whitelist)

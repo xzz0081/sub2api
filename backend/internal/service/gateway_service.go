@@ -638,6 +638,7 @@ type GatewayService struct {
 	tlsFPProfileService   *TLSFingerprintProfileService
 	balanceNotifyService  *BalanceNotifyService
 	userPlatformQuotaRepo UserPlatformQuotaRepository
+	trajectoryCollector   *TrajectoryCollector // 轨迹采集器（环境变量驱动，默认关闭）
 }
 
 // NewGatewayService creates a new GatewayService
@@ -718,6 +719,7 @@ func NewGatewayService(
 	if path := strings.TrimSpace(os.Getenv(debugGatewayBodyEnv)); path != "" {
 		svc.initDebugGatewayBodyFile(path)
 	}
+	svc.trajectoryCollector = newTrajectoryCollectorFromEnv()
 	return svc
 }
 
@@ -5122,6 +5124,10 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 		parsed.OnUpstreamAccepted()
 	}
 
+	// 轨迹采集：满足采购条件时建立采集上下文，挂到 gin.Context 供流式/非流式 handler 写入。
+	// 完全旁路，不影响转发；采集失败仅记日志。
+	s.maybeBeginTrajectoryCapture(c, parsed, originalModel, reqStream)
+
 	var usage *ClaudeUsage
 	var firstTokenMs *int
 	var clientDisconnect bool
@@ -7604,6 +7610,26 @@ func (s *GatewayService) handleStreamingResponse(ctx context.Context, resp *http
 
 	usage := &ClaudeUsage{}
 	var firstTokenMs *int
+
+	// 轨迹采集（流式）：累积每个 SSE event，流结束后重组为完整 message body。
+	var trajCap *trajectoryCapture
+	if s.trajectoryCollector.Enabled() {
+		trajCap = getTrajectoryCapture(c)
+	}
+	// 无论从哪个 return 退出，只要累积到了事件就重组并落盘（异步，不阻塞）。
+	defer func() {
+		if trajCap == nil || len(trajCap.streamEvents) == 0 {
+			return
+		}
+		respBody, err := reassembleAnthropicMessage(trajCap.streamEvents)
+		if err != nil {
+			logger.LegacyPrintf("service.trajectory", "reassemble stream message failed: session=%s err=%v", trajCap.sessionID, err)
+			return
+		}
+		trajCap.finalizeRequestID(resp.Header.Get("x-request-id"))
+		s.trajectoryCollector.Submit(trajCap, respBody)
+	}()
+
 	scanner := bufio.NewScanner(resp.Body)
 	// 设置更大的buffer以处理长行
 	maxLineSize := defaultMaxLineSize
@@ -7903,6 +7929,11 @@ func (s *GatewayService) handleStreamingResponse(ctx context.Context, resp *http
 						return &streamingResult{usage: usage, firstTokenMs: firstTokenMs, clientDisconnect: true}, nil
 					}
 					return nil, err
+				}
+
+				// 轨迹采集：累积本次 SSE event 的最终 data JSON（已 model 还原），供流结束后重组。
+				if trajCap != nil {
+					trajCap.appendStreamEvent(data)
 				}
 
 				for _, block := range outputBlocks {
@@ -8267,6 +8298,14 @@ func (s *GatewayService) handleNonStreamingResponse(ctx context.Context, resp *h
 
 	// 写入响应
 	c.Data(resp.StatusCode, contentType, body)
+
+	// 轨迹采集（非流式）：response body 已完整，直接提交。
+	if s.trajectoryCollector.Enabled() {
+		if cap := getTrajectoryCapture(c); cap != nil {
+			cap.finalizeRequestID(resp.Header.Get("x-request-id"))
+			s.trajectoryCollector.Submit(cap, body)
+		}
+	}
 
 	return &response.Usage, nil
 }

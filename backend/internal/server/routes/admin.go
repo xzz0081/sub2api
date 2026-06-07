@@ -97,6 +97,18 @@ func RegisterAdminRoutes(
 
 		// 邀请返利（专属用户管理）
 		registerAffiliateRoutes(admin, h)
+
+		// 轨迹采集统计
+		registerTrajectoryRoutes(admin, h)
+	}
+}
+
+// registerTrajectoryRoutes 注册轨迹采集统计路由（管理鉴权）。
+// GET /v1/admin/trajectory/stats 返回采集统计 JSON，供脚本监控采集进度。
+func registerTrajectoryRoutes(admin *gin.RouterGroup, h *handler.Handlers) {
+	trajectory := admin.Group("/trajectory")
+	{
+		trajectory.GET("/stats", h.Gateway.TrajectoryStats)
 	}
 }
 
