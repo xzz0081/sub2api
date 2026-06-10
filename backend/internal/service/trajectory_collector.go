@@ -201,8 +201,9 @@ type TrajectoryCollector struct {
 	statModelOpus47   atomic.Int64 // opus-4-7 落盘数
 
 	// 响应侧质检拒收计数（落盘前过滤掉的废数据，只看结构，不设硬编码阈值）。
-	statRejectedNoSignature   atomic.Int64 // thinking 块缺 signature 字段（上游剥离）
-	statRejectedBadStopReason atomic.Int64 // stop_reason 不是 end_turn（被工具调用或长度截断）
+	statRejectedNoSignature        atomic.Int64 // 响应侧 thinking 块缺 signature 字段（上游剥离）
+	statRejectedBadStopReason      atomic.Int64 // stop_reason 不是 end_turn（被工具调用或长度截断）
+	statRejectedRequestBadThinking atomic.Int64 // 请求侧 messages 历史 thinking 块 thinking 或 signature 为空
 
 	// 自动打包器（packer，v2 段语义）：每次 stop_reason==end_turn 落盘后立即触发 tryPackSegment，
 	// 不再有定时扫描兜底。packMu 保护 pack_state.json 读改写以及同 sid 的段切分。
@@ -313,12 +314,52 @@ func qualityCheckResponse(responseData []byte) string {
 	return ""
 }
 
+// qualityCheckRequestMessages 对请求侧 messages 历史里的 thinking 块做和响应侧同等强度的体检。
+// 对齐 §3.3 Call 级硬规则：「每个 thinking block 必须 thinking 非空且 signature 非空」——
+// 这条规则覆盖整条 call JSON 内所有 thinking 块，包括 request.messages 历史轮里的。
+//
+// 为何独立成函数：
+//   - 响应侧的 qualityCheckResponse 只看 response.response_data.content；
+//   - 但客户端把上一轮（可能被上游剥过 signature 的）assistant 响应塞进 messages 历史时，
+//     这条 call 的请求里就带着空 signature 的 thinking 块——按 §3.3 字面意思整条 call 不合格。
+//   - 不在采集层挡住，会把脏数据写盘，污染 manifest 和后续打包评估。
+//
+// 返回空串表示通过；非空串作为拒收原因，调用方自行计数。
+func qualityCheckRequestMessages(reqBody []byte) string {
+	var bad bool
+	gjson.GetBytes(reqBody, "messages").ForEach(func(_, msg gjson.Result) bool {
+		msg.Get("content").ForEach(func(_, item gjson.Result) bool {
+			if item.Get("type").String() != "thinking" {
+				return true
+			}
+			think := strings.TrimSpace(item.Get("thinking").String())
+			sig := strings.TrimSpace(item.Get("signature").String())
+			if think == "" || sig == "" {
+				bad = true
+				return false
+			}
+			return true
+		})
+		return !bad
+	})
+	if bad {
+		return "request_bad_thinking"
+	}
+	return ""
+}
+
 // Submit 异步提交一条采集记录。responseData 为完整 Anthropic message body（已解码）。
 func (tc *TrajectoryCollector) Submit(cap *trajectoryCapture, responseData []byte) {
 	if !tc.Enabled() || cap == nil {
 		return
 	}
 	if len(responseData) == 0 || len(cap.requestBody) == 0 {
+		return
+	}
+	// 请求侧质检：先看 messages 历史里的 thinking 块（§3.3 覆盖整条 call，请求侧也算）。
+	if reason := qualityCheckRequestMessages(cap.requestBody); reason != "" {
+		tc.statRejectedRequestBadThinking.Add(1)
+		logger.LegacyPrintf("service.trajectory", "reject sample: session=%s reason=%s", cap.sessionID, reason)
 		return
 	}
 	// 响应侧质检：落盘前最后一道闸，过不去的样本计入 rejected_*，绝不写盘。
@@ -776,10 +817,11 @@ type TrajectoryStats struct {
 	ToolUseEnd    int64 `json:"tool_use_end_saved"` // 末轮 tool_use 数（不合格末轮，需补完整结束轮）
 
 	// 响应侧质检拒收（落盘前过滤掉的废数据，按原因分桶）。仅保留无阈值的结构性规则。
-	RejectedNoSignature   int64   `json:"rejected_no_signature"`    // thinking 块缺 signature（上游剥离）
-	RejectedBadStopReason int64   `json:"rejected_bad_stop_reason"` // stop_reason 不是 end_turn
-	RejectedTotal         int64   `json:"rejected_total"`           // 各项之和，便于一眼看废数据总量
-	RejectRate            float64 `json:"reject_rate"`              // rejected_total / matched（多少命中样本被废）
+	RejectedNoSignature        int64   `json:"rejected_no_signature"`         // 响应侧 thinking 块缺 signature（上游剥离）
+	RejectedBadStopReason      int64   `json:"rejected_bad_stop_reason"`      // stop_reason 不是 end_turn
+	RejectedRequestBadThinking int64   `json:"rejected_request_bad_thinking"` // 请求侧 messages 历史 thinking 块缺 thinking 或 signature
+	RejectedTotal              int64   `json:"rejected_total"`                // 各项之和，便于一眼看废数据总量
+	RejectRate                 float64 `json:"reject_rate"`                   // rejected_total / matched（多少命中样本被废）
 
 	// token 累计。
 	TotalInputTokens  int64 `json:"total_input_tokens"`
@@ -837,8 +879,9 @@ func (tc *TrajectoryCollector) Stats() TrajectoryStats {
 		NonStreamSaved:    tc.statNonStreamSaved.Load(),
 		EndTurnSaved:      tc.statEndTurnSaved.Load(),
 		ToolUseEnd:        tc.statToolUseEndSaved.Load(),
-		RejectedNoSignature:   tc.statRejectedNoSignature.Load(),
-		RejectedBadStopReason: tc.statRejectedBadStopReason.Load(),
+		RejectedNoSignature:        tc.statRejectedNoSignature.Load(),
+		RejectedBadStopReason:      tc.statRejectedBadStopReason.Load(),
+		RejectedRequestBadThinking: tc.statRejectedRequestBadThinking.Load(),
 		TotalInputTokens:  tc.statInputTokens.Load(),
 		TotalOutputTokens: tc.statOutputTokens.Load(),
 		ModelOpus46:       tc.statModelOpus46.Load(),
