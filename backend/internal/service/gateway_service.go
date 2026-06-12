@@ -4692,6 +4692,14 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 		return nil, err
 	}
 
+	// 轨迹采集注入：仅对满足采购条件的请求注入 thinking.type=enabled + 总结引导。
+	// 不命中时零开销（一次 Enabled() + shouldCollectTrajectory 判定，均为内存操作）。
+	if injected, ok := s.maybeInjectForTrajectory(c, body, originalModel, parsed.OutputEffort); ok {
+		if err := replaceBody(injected); err != nil {
+			return nil, err
+		}
+	}
+
 	// 重试循环
 	var resp *http.Response
 	lastWireBody := body
