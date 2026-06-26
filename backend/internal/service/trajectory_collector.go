@@ -217,7 +217,6 @@ func (tc *TrajectoryCollector) Submit(cap *trajectoryCapture, responseData []byt
 	tc.statSubmitted.Add(1)
 	model := cap.model
 	stream := cap.stream
-	sid := rec.SessionID
 
 	go func() {
 		defer func() {
