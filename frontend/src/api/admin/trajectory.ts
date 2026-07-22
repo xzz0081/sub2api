@@ -4,8 +4,6 @@ export interface TrajectoryModelBreakdown {
   model: string
   sessions: number
   calls: number
-  input_tokens: number
-  output_tokens: number
 }
 
 export interface TrajectoryKeyStatsResult {
@@ -13,8 +11,6 @@ export interface TrajectoryKeyStatsResult {
   found: boolean
   sessions: number
   calls: number
-  input_tokens: number
-  output_tokens: number
   models: TrajectoryModelBreakdown[]
   earliest_call?: string
   latest_call?: string

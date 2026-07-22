@@ -546,27 +546,24 @@ func (tc *TrajectoryCollector) Stats() TrajectoryStats {
 
 // TrajectoryModelBreakdown 单模型下的统计。
 type TrajectoryModelBreakdown struct {
-	Model        string `json:"model"`
-	Sessions     int64  `json:"sessions"`
-	Calls        int64  `json:"calls"`
-	InputTokens  int64  `json:"input_tokens"`
-	OutputTokens int64  `json:"output_tokens"`
+	Model    string `json:"model"`
+	Sessions int64  `json:"sessions"`
+	Calls    int64  `json:"calls"`
 }
 
 // TrajectoryKeyStatsResult 单个 API key 的轨迹统计（扫描磁盘计算）。
 type TrajectoryKeyStatsResult struct {
-	Key          string                      `json:"key"`
-	Found        bool                        `json:"found"`
-	Sessions     int64                       `json:"sessions"`
-	Calls        int64                       `json:"calls"`
-	InputTokens  int64                       `json:"input_tokens"`
-	OutputTokens int64                       `json:"output_tokens"`
-	Models       []TrajectoryModelBreakdown  `json:"models"`
-	EarliestCall string                      `json:"earliest_call,omitempty"`
-	LatestCall   string                      `json:"latest_call,omitempty"`
+	Key          string                     `json:"key"`
+	Found        bool                       `json:"found"`
+	Sessions     int64                      `json:"sessions"`
+	Calls        int64                      `json:"calls"`
+	Models       []TrajectoryModelBreakdown `json:"models"`
+	EarliestCall string                     `json:"earliest_call,omitempty"`
+	LatestCall   string                     `json:"latest_call,omitempty"`
 }
 
-// KeyStats 扫描磁盘，统计指定 API key 下的 session/call/token 数据。
+// KeyStats 扫描磁盘，统计指定 API key 下的 session/call 数量。
+// 只做目录/文件计数，不读取文件内容，速度极快。
 // 目录结构：sessions/{key}/{model}/{sessionID}/{ts}__{requestID}.json
 func (tc *TrajectoryCollector) KeyStats(key string) TrajectoryKeyStatsResult {
 	result := TrajectoryKeyStatsResult{Key: key}
@@ -614,18 +611,7 @@ func (tc *TrajectoryCollector) KeyStats(key string) TrajectoryKeyStatsResult {
 				mb.Calls++
 				result.Calls++
 
-				callPath := filepath.Join(sessDir, callEntry.Name())
-				raw, err := os.ReadFile(callPath)
-				if err != nil {
-					continue
-				}
-				in := gjson.GetBytes(raw, "response.response_data.usage.input_tokens").Int()
-				out := gjson.GetBytes(raw, "response.response_data.usage.output_tokens").Int()
-				mb.InputTokens += in
-				mb.OutputTokens += out
-				result.InputTokens += in
-				result.OutputTokens += out
-
+				// 从文件名推算首末时间，无需读取文件内容
 				// 文件名格式：{ts}__{reqID}.json，ts 已被替换过 ":" → "-" "." → "-"
 				ts := strings.SplitN(callEntry.Name(), "__", 2)[0]
 				if earliest == "" || ts < earliest {

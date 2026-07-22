@@ -59,9 +59,9 @@
 
     <!-- 结果面板 -->
     <template v-if="result && result.found">
-      <!-- 汇总指标 -->
+      <!-- 汇总 -->
       <div class="rounded-3xl bg-white shadow-sm ring-1 ring-gray-900/5 dark:bg-dark-800 dark:ring-dark-700">
-        <!-- Key 标头 -->
+        <!-- Key + 时间 -->
         <div class="flex flex-wrap items-center justify-between gap-3 border-b border-gray-100 px-6 py-4 dark:border-dark-700">
           <div class="flex items-center gap-2 min-w-0">
             <div class="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-green-50 dark:bg-green-900/20">
@@ -72,7 +72,7 @@
             <code class="truncate rounded-lg bg-gray-100 px-2.5 py-1 font-mono text-xs text-gray-700 dark:bg-dark-700 dark:text-gray-300">{{ result.key }}</code>
           </div>
           <div v-if="result.earliest_call || result.latest_call" class="flex items-center gap-1.5 text-xs text-gray-400 dark:text-gray-500">
-            <svg class="h-3.5 w-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+            <svg class="h-3.5 w-3.5 shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
               <path stroke-linecap="round" stroke-linejoin="round" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
             </svg>
             <span v-if="result.earliest_call">{{ formatTimestamp(result.earliest_call) }}</span>
@@ -81,52 +81,25 @@
           </div>
         </div>
 
-        <!-- 4 指标横排 -->
-        <div class="grid grid-cols-2 divide-x divide-y divide-gray-100 dark:divide-dark-700 md:grid-cols-4 md:divide-y-0">
-          <div class="flex flex-col items-center justify-center gap-1 px-6 py-6">
+        <!-- 2 核心指标 -->
+        <div class="grid grid-cols-2 divide-x divide-gray-100 dark:divide-dark-700">
+          <div class="flex flex-col items-center justify-center gap-1 px-6 py-8">
             <span class="text-xs font-medium uppercase tracking-wider text-gray-400 dark:text-gray-500">Sessions</span>
-            <span class="text-3xl font-bold tabular-nums text-gray-900 dark:text-white">{{ result.sessions.toLocaleString() }}</span>
+            <span class="text-4xl font-bold tabular-nums text-gray-900 dark:text-white">{{ result.sessions.toLocaleString() }}</span>
             <span class="text-xs text-gray-400 dark:text-gray-500">对话轮次</span>
           </div>
-          <div class="flex flex-col items-center justify-center gap-1 px-6 py-6">
+          <div class="flex flex-col items-center justify-center gap-1 px-6 py-8">
             <span class="text-xs font-medium uppercase tracking-wider text-gray-400 dark:text-gray-500">Calls</span>
-            <span class="text-3xl font-bold tabular-nums text-indigo-600 dark:text-indigo-400">{{ result.calls.toLocaleString() }}</span>
+            <span class="text-4xl font-bold tabular-nums text-indigo-600 dark:text-indigo-400">{{ result.calls.toLocaleString() }}</span>
             <span class="text-xs text-gray-400 dark:text-gray-500">LLM 请求次数</span>
-          </div>
-          <div class="flex flex-col items-center justify-center gap-1 px-6 py-6">
-            <span class="text-xs font-medium uppercase tracking-wider text-gray-400 dark:text-gray-500">Input Tokens</span>
-            <span class="text-3xl font-bold tabular-nums text-sky-600 dark:text-sky-400">{{ formatTokens(result.input_tokens) }}</span>
-            <span class="text-xs text-gray-400 dark:text-gray-500">{{ result.input_tokens.toLocaleString() }}</span>
-          </div>
-          <div class="flex flex-col items-center justify-center gap-1 px-6 py-6">
-            <span class="text-xs font-medium uppercase tracking-wider text-gray-400 dark:text-gray-500">Output Tokens</span>
-            <span class="text-3xl font-bold tabular-nums text-violet-600 dark:text-violet-400">{{ formatTokens(result.output_tokens) }}</span>
-            <span class="text-xs text-gray-400 dark:text-gray-500">{{ result.output_tokens.toLocaleString() }}</span>
           </div>
         </div>
 
-        <!-- 总消耗 bar -->
-        <div class="border-t border-gray-100 px-6 py-4 dark:border-dark-700">
-          <div class="flex items-center justify-between text-xs text-gray-500 dark:text-gray-400">
-            <span>总 Token 消耗</span>
-            <span class="font-semibold text-gray-900 dark:text-white">{{ formatTokens(result.input_tokens + result.output_tokens) }} <span class="font-normal text-gray-400">({{ (result.input_tokens + result.output_tokens).toLocaleString() }})</span></span>
-          </div>
-          <div class="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-gray-100 dark:bg-dark-700">
-            <div class="flex h-full overflow-hidden rounded-full">
-              <div
-                class="h-full bg-sky-400 transition-all"
-                :style="{ width: inputPercent + '%' }"
-              />
-              <div
-                class="h-full bg-violet-400 transition-all"
-                :style="{ width: outputPercent + '%' }"
-              />
-            </div>
-          </div>
-          <div class="mt-1.5 flex gap-4 text-xs text-gray-400 dark:text-gray-500">
-            <span class="flex items-center gap-1"><span class="inline-block h-2 w-2 rounded-sm bg-sky-400" />Input {{ inputPercent.toFixed(1) }}%</span>
-            <span class="flex items-center gap-1"><span class="inline-block h-2 w-2 rounded-sm bg-violet-400" />Output {{ outputPercent.toFixed(1) }}%</span>
-          </div>
+        <!-- 均值 -->
+        <div class="border-t border-gray-100 px-6 py-3 dark:border-dark-700">
+          <p class="text-center text-xs text-gray-400 dark:text-gray-500">
+            平均每 session <span class="font-semibold text-gray-700 dark:text-gray-300">{{ avgCallsPerSession }}</span> 次调用
+          </p>
         </div>
       </div>
 
@@ -146,8 +119,6 @@
                 <th class="py-3 pl-6 pr-4 text-left text-xs font-medium uppercase tracking-wider text-gray-400 dark:text-gray-500">模型</th>
                 <th class="px-4 py-3 text-right text-xs font-medium uppercase tracking-wider text-gray-400 dark:text-gray-500">Sessions</th>
                 <th class="px-4 py-3 text-right text-xs font-medium uppercase tracking-wider text-gray-400 dark:text-gray-500">Calls</th>
-                <th class="px-4 py-3 text-right text-xs font-medium uppercase tracking-wider text-gray-400 dark:text-gray-500">Input</th>
-                <th class="px-4 py-3 text-right text-xs font-medium uppercase tracking-wider text-gray-400 dark:text-gray-500">Output</th>
                 <th class="py-3 pl-4 pr-6 text-right text-xs font-medium uppercase tracking-wider text-gray-400 dark:text-gray-500">占比</th>
               </tr>
             </thead>
@@ -155,22 +126,17 @@
               <tr
                 v-for="m in sortedModels"
                 :key="m.model"
-                class="group transition-colors hover:bg-gray-50/60 dark:hover:bg-dark-700/40"
+                class="transition-colors hover:bg-gray-50/60 dark:hover:bg-dark-700/40"
               >
                 <td class="py-3.5 pl-6 pr-4">
-                  <span class="inline-block max-w-[200px] truncate rounded-md bg-gray-100 px-2 py-0.5 font-mono text-xs text-gray-700 dark:bg-dark-700 dark:text-gray-300">{{ m.model }}</span>
+                  <span class="inline-block max-w-[240px] truncate rounded-md bg-gray-100 px-2 py-0.5 font-mono text-xs text-gray-700 dark:bg-dark-700 dark:text-gray-300">{{ m.model }}</span>
                 </td>
                 <td class="px-4 py-3.5 text-right tabular-nums text-gray-600 dark:text-gray-400">{{ m.sessions.toLocaleString() }}</td>
                 <td class="px-4 py-3.5 text-right tabular-nums font-medium text-indigo-600 dark:text-indigo-400">{{ m.calls.toLocaleString() }}</td>
-                <td class="px-4 py-3.5 text-right tabular-nums text-sky-600 dark:text-sky-400">{{ formatTokens(m.input_tokens) }}</td>
-                <td class="px-4 py-3.5 text-right tabular-nums text-violet-600 dark:text-violet-400">{{ formatTokens(m.output_tokens) }}</td>
                 <td class="py-3.5 pl-4 pr-6">
                   <div class="flex items-center justify-end gap-2">
-                    <div class="h-1.5 w-20 overflow-hidden rounded-full bg-gray-100 dark:bg-dark-700">
-                      <div
-                        class="h-full rounded-full bg-indigo-400 transition-all"
-                        :style="{ width: callPercent(m.calls) + '%' }"
-                      />
+                    <div class="h-1.5 w-24 overflow-hidden rounded-full bg-gray-100 dark:bg-dark-700">
+                      <div class="h-full rounded-full bg-indigo-400 transition-all" :style="{ width: callPercent(m.calls) + '%' }" />
                     </div>
                     <span class="w-10 text-right text-xs tabular-nums text-gray-400 dark:text-gray-500">{{ callPercent(m.calls).toFixed(1) }}%</span>
                   </div>
@@ -182,8 +148,6 @@
                 <td class="py-3.5 pl-6 pr-4 text-xs font-semibold text-gray-700 dark:text-gray-300">合计</td>
                 <td class="px-4 py-3.5 text-right text-xs font-semibold tabular-nums text-gray-700 dark:text-gray-300">{{ result.sessions.toLocaleString() }}</td>
                 <td class="px-4 py-3.5 text-right text-xs font-semibold tabular-nums text-indigo-600 dark:text-indigo-400">{{ result.calls.toLocaleString() }}</td>
-                <td class="px-4 py-3.5 text-right text-xs font-semibold tabular-nums text-sky-600 dark:text-sky-400">{{ formatTokens(result.input_tokens) }}</td>
-                <td class="px-4 py-3.5 text-right text-xs font-semibold tabular-nums text-violet-600 dark:text-violet-400">{{ formatTokens(result.output_tokens) }}</td>
                 <td class="py-3.5 pl-4 pr-6 text-right text-xs font-semibold text-gray-700 dark:text-gray-300">100%</td>
               </tr>
             </tfoot>
@@ -224,31 +188,18 @@ const sortedModels = computed(() => {
   return [...result.value.models].sort((a, b) => b.calls - a.calls)
 })
 
-const totalTokens = computed(() => (result.value?.input_tokens ?? 0) + (result.value?.output_tokens ?? 0))
-
-const inputPercent = computed(() => {
-  if (!totalTokens.value) return 50
-  return (result.value!.input_tokens / totalTokens.value) * 100
+const avgCallsPerSession = computed(() => {
+  if (!result.value?.sessions) return '0'
+  return (result.value.calls / result.value.sessions).toFixed(1)
 })
-const outputPercent = computed(() => 100 - inputPercent.value)
 
 function callPercent(calls: number): number {
   if (!result.value?.calls) return 0
   return (calls / result.value.calls) * 100
 }
 
-function formatTokens(n: number): string {
-  if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + 'M'
-  if (n >= 1_000) return (n / 1_000).toFixed(1) + 'K'
-  return n.toLocaleString()
-}
-
 function formatTimestamp(ts: string): string {
   if (!ts) return ''
-  // 文件名里 ":" → "-", "." → "-"，近似还原展示
-  return ts
-    .replace(/T(\d{2})-(\d{2})-(\d{2})-\d+Z/, ' $1:$2:$3')
-    .replace(/^(\d{4}-\d{2}-\d{2})/, '$1')
-    + ' UTC'
+  return ts.replace(/T(\d{2})-(\d{2})-(\d{2})-\d+Z/, ' $1:$2:$3').replace('T', ' ') + ' UTC'
 }
 </script>
