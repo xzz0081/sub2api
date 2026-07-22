@@ -109,6 +109,7 @@ func registerTrajectoryRoutes(admin *gin.RouterGroup, h *handler.Handlers) {
 	trajectory := admin.Group("/trajectory")
 	{
 		trajectory.GET("/stats", h.Gateway.TrajectoryStats)
+		trajectory.GET("/key-stats", h.Gateway.TrajectoryKeyStats)
 	}
 }
 

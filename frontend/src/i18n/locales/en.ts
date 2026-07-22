@@ -388,6 +388,7 @@ export default {
     channelMonitor: 'Channel Monitor',
     channelStatus: 'Channel Status',
     riskControl: 'Risk Control',
+    trajectoryQuery: 'Trajectory Query',
   },
 
   // Auth

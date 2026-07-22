@@ -975,6 +975,18 @@ func (h *GatewayHandler) TrajectoryStats(c *gin.Context) {
 	c.JSON(http.StatusOK, stats)
 }
 
+// TrajectoryKeyStats 扫描磁盘，返回指定 API key 下的轨迹统计。
+// GET /v1/admin/trajectory/key-stats?key=xxx
+func (h *GatewayHandler) TrajectoryKeyStats(c *gin.Context) {
+	key := strings.TrimSpace(c.Query("key"))
+	if key == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "key is required"})
+		return
+	}
+	result := h.gatewayService.TrajectoryKeyStats(key)
+	c.JSON(http.StatusOK, result)
+}
+
 // Models handles listing available models
 // GET /v1/models
 // Returns models based on account configurations (model_mapping whitelist)

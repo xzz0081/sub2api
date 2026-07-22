@@ -653,6 +653,17 @@ const routes: RouteRecordRaw[] = [
     }
   },
 
+  {
+    path: '/admin/trajectory',
+    name: 'AdminTrajectory',
+    component: () => import('@/views/admin/TrajectoryKeyStatsView.vue'),
+    meta: {
+      requiresAuth: true,
+      requiresAdmin: true,
+      title: '轨迹查询'
+    }
+  },
+
   // ==================== 404 Not Found ====================
   {
     path: '/:pathMatch(.*)*',

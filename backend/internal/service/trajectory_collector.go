@@ -51,6 +51,7 @@ type trajectoryCapture struct {
 	sessionID      string
 	requestID      string
 	model          string    // 原始客户端模型名（用于落盘）
+	callerKey      string    // 调用方 API key 字符串（用于落盘父目录隔离）
 	thinkingEffort string    // high / xhigh / max
 	timestamp      time.Time // 请求开始时刻（UTC）
 	requestBody    []byte    // 原始 Anthropic request body（副本）
@@ -87,10 +88,18 @@ func (s *GatewayService) maybeBeginTrajectoryCapture(c *gin.Context, parsed *Par
 	reqCopy := make([]byte, len(body))
 	copy(reqCopy, body)
 
+	callerKey := ""
+	if v, exists := c.Get("api_key"); exists {
+		if ak, ok := v.(*APIKey); ok && ak != nil {
+			callerKey = ak.Key
+		}
+	}
+
 	cap := &trajectoryCapture{
 		sessionID:      s.GenerateSessionHash(parsed),
 		requestID:      "",
 		model:          originalModel,
+		callerKey:      callerKey,
 		thinkingEffort: strings.ToLower(strings.TrimSpace(parsed.OutputEffort)),
 		timestamp:      time.Now().UTC(),
 		requestBody:    reqCopy,
@@ -216,6 +225,7 @@ func (tc *TrajectoryCollector) Submit(cap *trajectoryCapture, responseData []byt
 
 	tc.statSubmitted.Add(1)
 	model := cap.model
+	callerKey := cap.callerKey
 	stream := cap.stream
 
 	go func() {
@@ -224,7 +234,7 @@ func (tc *TrajectoryCollector) Submit(cap *trajectoryCapture, responseData []byt
 				logger.LegacyPrintf("service.trajectory", "panic while writing trajectory: %v", r)
 			}
 		}()
-		if err := tc.write(rec, model); err != nil {
+		if err := tc.write(rec, model, callerKey); err != nil {
 			tc.statSaveFailed.Add(1)
 			logger.LegacyPrintf("service.trajectory", "write trajectory failed: session=%s request=%s err=%v", rec.SessionID, rec.RequestID, err)
 			return
@@ -264,8 +274,8 @@ func marshalNoEscapeIndent(v interface{}) ([]byte, error) {
 	return bytes.TrimRight(buf.Bytes(), "\n"), nil
 }
 
-// write 把一条记录写盘：sessions/{model}/{session}/{ts}__{req}.json。
-func (tc *TrajectoryCollector) write(rec *trajectoryTopRecord, model string) error {
+// write 把一条记录写盘：sessions/{callerKey}/{model}/{session}/{ts}__{req}.json。
+func (tc *TrajectoryCollector) write(rec *trajectoryTopRecord, model string, callerKey string) error {
 	pretty, err := marshalNoEscapeIndent(rec)
 	if err != nil {
 		return fmt.Errorf("marshal: %w", err)
@@ -274,7 +284,7 @@ func (tc *TrajectoryCollector) write(rec *trajectoryTopRecord, model string) err
 		pretty = tc.redactSecrets(pretty)
 	}
 	tsFile := strings.NewReplacer(":", "-", ".", "-").Replace(rec.Timestamp)
-	sessionDir := filepath.Join(tc.dir, "sessions", sanitizePathSegment(model), sanitizePathSegment(rec.SessionID))
+	sessionDir := filepath.Join(tc.dir, "sessions", sanitizePathSegment(callerKey), sanitizePathSegment(model), sanitizePathSegment(rec.SessionID))
 	if err := os.MkdirAll(sessionDir, 0o755); err != nil {
 		return fmt.Errorf("mkdir: %w", err)
 	}
@@ -530,10 +540,125 @@ func (tc *TrajectoryCollector) Stats() TrajectoryStats {
 
 // readManifestCounts — removed (manifest.json no longer written)
 
+// =============================================================================
+// Per-key filesystem stats
+// =============================================================================
+
+// TrajectoryModelBreakdown 单模型下的统计。
+type TrajectoryModelBreakdown struct {
+	Model        string `json:"model"`
+	Sessions     int64  `json:"sessions"`
+	Calls        int64  `json:"calls"`
+	InputTokens  int64  `json:"input_tokens"`
+	OutputTokens int64  `json:"output_tokens"`
+}
+
+// TrajectoryKeyStatsResult 单个 API key 的轨迹统计（扫描磁盘计算）。
+type TrajectoryKeyStatsResult struct {
+	Key          string                      `json:"key"`
+	Found        bool                        `json:"found"`
+	Sessions     int64                       `json:"sessions"`
+	Calls        int64                       `json:"calls"`
+	InputTokens  int64                       `json:"input_tokens"`
+	OutputTokens int64                       `json:"output_tokens"`
+	Models       []TrajectoryModelBreakdown  `json:"models"`
+	EarliestCall string                      `json:"earliest_call,omitempty"`
+	LatestCall   string                      `json:"latest_call,omitempty"`
+}
+
+// KeyStats 扫描磁盘，统计指定 API key 下的 session/call/token 数据。
+// 目录结构：sessions/{key}/{model}/{sessionID}/{ts}__{requestID}.json
+func (tc *TrajectoryCollector) KeyStats(key string) TrajectoryKeyStatsResult {
+	result := TrajectoryKeyStatsResult{Key: key}
+	if tc == nil || key == "" {
+		return result
+	}
+	keyDir := filepath.Join(tc.dir, "sessions", sanitizePathSegment(key))
+	modelEntries, err := os.ReadDir(keyDir)
+	if err != nil {
+		return result // 目录不存在或无权限均视为 not found
+	}
+	result.Found = true
+
+	var earliest, latest string
+	modelMap := make(map[string]*TrajectoryModelBreakdown)
+
+	for _, modelEntry := range modelEntries {
+		if !modelEntry.IsDir() {
+			continue
+		}
+		modelName := modelEntry.Name()
+		mb := &TrajectoryModelBreakdown{Model: modelName}
+		modelDir := filepath.Join(keyDir, modelName)
+
+		sessionEntries, err := os.ReadDir(modelDir)
+		if err != nil {
+			continue
+		}
+		for _, sessEntry := range sessionEntries {
+			if !sessEntry.IsDir() {
+				continue
+			}
+			mb.Sessions++
+			result.Sessions++
+			sessDir := filepath.Join(modelDir, sessEntry.Name())
+
+			callEntries, err := os.ReadDir(sessDir)
+			if err != nil {
+				continue
+			}
+			for _, callEntry := range callEntries {
+				if callEntry.IsDir() || !strings.HasSuffix(callEntry.Name(), ".json") {
+					continue
+				}
+				mb.Calls++
+				result.Calls++
+
+				callPath := filepath.Join(sessDir, callEntry.Name())
+				raw, err := os.ReadFile(callPath)
+				if err != nil {
+					continue
+				}
+				in := gjson.GetBytes(raw, "response.response_data.usage.input_tokens").Int()
+				out := gjson.GetBytes(raw, "response.response_data.usage.output_tokens").Int()
+				mb.InputTokens += in
+				mb.OutputTokens += out
+				result.InputTokens += in
+				result.OutputTokens += out
+
+				// 文件名格式：{ts}__{reqID}.json，ts 已被替换过 ":" → "-" "." → "-"
+				ts := strings.SplitN(callEntry.Name(), "__", 2)[0]
+				if earliest == "" || ts < earliest {
+					earliest = ts
+				}
+				if ts > latest {
+					latest = ts
+				}
+			}
+		}
+		modelMap[modelName] = mb
+	}
+
+	for _, mb := range modelMap {
+		result.Models = append(result.Models, *mb)
+	}
+	result.EarliestCall = earliest
+	result.LatestCall = latest
+	return result
+}
+
 // TrajectoryStats 暴露采集统计快照给上层（handler）。采集器未初始化时返回 disabled。
 func (s *GatewayService) TrajectoryStats() TrajectoryStats {
 	if s == nil || s.trajectoryCollector == nil {
 		return TrajectoryStats{Enabled: false}
 	}
 	return s.trajectoryCollector.Stats()
+}
+
+// TrajectoryKeyStats 扫描磁盘，返回指定 API key 的轨迹统计。
+func (s *GatewayService) TrajectoryKeyStats(key string) TrajectoryKeyStatsResult {
+	if s == nil || s.trajectoryCollector == nil {
+		return TrajectoryKeyStatsResult{Key: key}
+	}
+	return s.trajectoryCollector.KeyStats(key)
 }
