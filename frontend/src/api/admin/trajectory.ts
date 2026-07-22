@@ -17,7 +17,7 @@ export interface TrajectoryKeyStatsResult {
 }
 
 export async function getTrajectoryKeyStats(key: string): Promise<TrajectoryKeyStatsResult> {
-  const { data } = await apiClient.get<TrajectoryKeyStatsResult>('/admin/trajectory/key-stats', {
+  const { data } = await apiClient.get<TrajectoryKeyStatsResult>('/trajectory/key-stats', {
     params: { key }
   })
   return data

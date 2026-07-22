@@ -14,6 +14,12 @@ func RegisterAdminRoutes(
 	h *handler.Handlers,
 	adminAuth middleware.AdminAuthMiddleware,
 ) {
+	// 公开轨迹查询接口（无需鉴权）
+	public := v1.Group("/trajectory")
+	{
+		public.GET("/key-stats", h.Gateway.TrajectoryKeyStats)
+	}
+
 	admin := v1.Group("/admin")
 	admin.Use(gin.HandlerFunc(adminAuth))
 	{

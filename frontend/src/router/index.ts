@@ -658,8 +658,7 @@ const routes: RouteRecordRaw[] = [
     name: 'AdminTrajectory',
     component: () => import('@/views/admin/TrajectoryKeyStatsView.vue'),
     meta: {
-      requiresAuth: true,
-      requiresAdmin: true,
+      requiresAuth: false,
       title: '轨迹查询'
     }
   },
